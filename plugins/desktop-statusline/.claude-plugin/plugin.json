@@ -1,7 +1,21 @@
 {
   "name": "desktop-statusline",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": { "name": "OdinsEntropy", "url": "https://github.com/OdinsEntropy" },
   "types": "./types/index.d.ts",
-  "description": "Claude desktop app only. A usage bar above the prompt with context, 5-hour and 7-day limits, a prompt cache countdown and the session cost at API prices."
+  "description": "Claude desktop app only. A usage bar above the prompt with context, 5-hour and 7-day limits, a prompt cache countdown with a keep-warm button and the session cost at API prices.",
+  "userConfig": {
+    "subscriptionUsd": {
+      "type": "number",
+      "title": "Monthly subscription (USD)",
+      "description": "What your Claude plan costs a month. The Eq. API bar is full at 1x this, light blue from 2x and gold from 5x.",
+      "default": 20
+    },
+    "inputPrices": {
+      "type": "string",
+      "title": "Input price overrides",
+      "description": "Only if Anthropic's prices change: part of a model id = input USD per million tokens, comma-separated, e.g. opus-5-5=4, sonnet-5-5=2. Empty uses the built-in prices.",
+      "default": ""
+    }
+  }
 }

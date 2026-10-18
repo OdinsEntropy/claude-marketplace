@@ -17,6 +17,8 @@ export type StatusSnapshot = {
   costUsd?: number
   /** how long the prompt cache lives: an hour on a subscription, else five minutes */
   cacheTtlMs: number
+  /** what writing the whole context to the cache again would cost at API prices, in US dollars; absent for an unknown model */
+  reloadUsd?: number
 }
 
 declare module 'claude-code' {
@@ -28,6 +30,10 @@ declare module 'claude-code' {
       lastTouch: number | null
       /** the clock, bumped every second so the cache countdown redraws */
       now: number
+      /** true while a press of the cache's refresh button is warming it */
+      isWarming: boolean
+      /** whether the cache is kept warm automatically, 10 minutes before it would lapse */
+      isAuto: boolean
     }
   }
 }

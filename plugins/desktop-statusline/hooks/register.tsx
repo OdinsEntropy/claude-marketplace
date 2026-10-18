@@ -1,9 +1,10 @@
 // A usage card above the prompt in the desktop app: context, the 5-hour and
 // weekly limits, what the session would cost at API prices and how long the
-// prompt cache stays warm. The terminal keeps its own status line; this
-// card draws on the desktop only.
+// prompt cache stays warm, with a button that keeps it warm and, once it has
+// gone cold, what writing it again would cost. The terminal keeps its own
+// status line; this card draws on the desktop only.
 import { atom, read, update } from 'claude-code'
-import type { Color, EngineInterface, Register, SessionRateLimit } from 'claude-code'
+import type { Color, EngineInterface, Register, RenderElement, SessionRateLimit } from 'claude-code'
 
 import type { Meter, StatusSnapshot } from '../types'
 
@@ -18,8 +19,28 @@ const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', '
 const snapshot = atom({ plugin: 'desktop-statusline', key: 'snapshot' } as const, null)
 const lastTouch = atom({ plugin: 'desktop-statusline', key: 'lastTouch' } as const, null)
 const now = atom({ plugin: 'desktop-statusline', key: 'now' } as const, 0)
+const isWarming = atom({ plugin: 'desktop-statusline', key: 'isWarming' } as const, false)
+const isAuto = atom({ plugin: 'desktop-statusline', key: 'isAuto' } as const, false)
 
 let isRefreshing = false
+
+// The userConfig options, set by register on each load.
+let subscriptionUsd = 20
+let priceOverrides: [RegExp, number][] = []
+
+// Until when /cache-cold shows the cold state (a preview; the cache is untouched).
+let previewColdUntil = 0
+const PREVIEW_MS = 15_000
+
+// Auto keep-warm: warm the cache this long before it lapses, stop after this
+// long without a real turn (so an idle session does not spend forever), and
+// wait this long after a try before the next one.
+export const AUTO_LEAD_MS = 10 * 60_000
+export const AUTO_MAX_IDLE_MS = 6 * 60 * 60_000
+const AUTO_RETRY_MS = 60_000
+let isTurnRunning = false
+let lastRealTurn = 0
+let lastAutoTry = 0
 
 // 245k / 1M
 export const formatTokens = (n: number) => {
@@ -93,15 +114,61 @@ const level = (pct: number) => (pct >= 90 ? 3 : pct >= 70 ? 2 : pct >= 50 ? 1 : 
 const TEXT_COLORS: Color[] = ['success', 'warning', 'claude', 'error']
 const BAR_COLORS = ['#2f9e6b', '#d4a20f', '#e07b39', '#e5484d']
 
-// The API-cost bar fills up to $20; past that it stays full and changes colour
-// at $40 (light blue) and $100 (gold).
-const COST_FULL_USD = 20
-export const costTier = (usd: number): { pct: number; bar: string; text: Color } =>
-  usd >= 100
+// The API-cost bar measures the session against your subscription: it fills up
+// to 1x the monthly price (the `subscriptionUsd` option, $20 by default), then
+// stays full and turns light blue at 2x and gold at 5x.
+export const DEFAULT_SUBSCRIPTION_USD = 20
+export const costTier = (usd: number, subscriptionUsd = DEFAULT_SUBSCRIPTION_USD): { pct: number; bar: string; text: Color } =>
+  usd >= subscriptionUsd * 5
     ? { pct: 100, bar: '#d4af37', text: '#b8901c' }
-    : usd >= 40
+    : usd >= subscriptionUsd * 2
       ? { pct: 100, bar: '#4cc3f0', text: '#2a9fd0' }
-      : { pct: Math.min(100, (usd / COST_FULL_USD) * 100), bar: BAR_COLORS[0]!, text: 'success' }
+      : { pct: Math.min(100, (usd / subscriptionUsd) * 100), bar: BAR_COLORS[0]!, text: 'success' }
+
+// Input price per million tokens at API rates, first match wins. Hard-coded from
+// Anthropic's pricing of October 2026; the `inputPrices` option overrides it.
+// Haiku 5.5 costs more past 100k tokens of prompt.
+type PriceRow = [RegExp, number]
+const INPUT_USD_PER_MTOK: PriceRow[] = [
+  [/fable|mythos/, 10],
+  [/opus-5-5/, 4],
+  [/opus/, 5],
+  [/sonnet-5/, 2],
+  [/sonnet/, 3],
+  [/haiku-5-5/, 0.1],
+  [/haiku/, 1],
+]
+const HAIKU_LONG_PROMPT_USD_PER_MTOK = 0.5
+
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+// "opus-5-5=4, sonnet=2.5": a part of the model id, then its input price per
+// million tokens. Parts that do not parse are skipped.
+export const parsePrices = (text: string): PriceRow[] =>
+  text
+    .split(/[,;\n]/)
+    .map(part => /^\s*([\w.[\]-]+)\s*=\s*\$?\s*(\d+(?:\.\d+)?)\s*$/.exec(part))
+    .filter((m): m is RegExpExecArray => m !== null)
+    .map(m => [new RegExp(escapeRegExp(m[1]!.toLowerCase())), Number(m[2])])
+
+// Writing to the cache costs 2x the input price with the one-hour lifetime and
+// 1.25x with the five-minute one. `overrides` are tried before the built-in table.
+export const reloadCostUsd = (model: string, tokens: number, ttlMs: number, overrides: PriceRow[] = []): number | undefined => {
+  const id = model.toLowerCase()
+  const override = overrides.find(([pattern]) => pattern.test(id))
+  const match = override ?? INPUT_USD_PER_MTOK.find(([pattern]) => pattern.test(id))
+
+  if (match === undefined || tokens <= 0) {
+    return undefined
+  }
+
+  const perMTok = override === undefined && /haiku-5-5/.test(id) && tokens > 100_000 ? HAIKU_LONG_PROMPT_USD_PER_MTOK : match[1]
+
+  return (tokens / 1_000_000) * perMTok * (ttlMs >= SUBSCRIPTION_CACHE_TTL_MS ? 2 : 1.25)
+}
+
+// $2.10, or ¢ under a dime
+export const formatReload = (usd: number) => (usd < 0.1 ? `${Math.max(1, Math.round(usd * 100))}¢` : `$${usd.toFixed(2)}`)
 
 const escapeXml = (text: string) => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
@@ -127,9 +194,10 @@ async function refresh($: EngineInterface) {
   isRefreshing = true
 
   try {
-    const [usage, t] = await Promise.all([$.session.usage(), $.clock.now()])
+    const [usage, t, model] = await Promise.all([$.session.usage(), $.clock.now(), $.session.model()])
     const { tokens = 0, window } = usage.context
     const limits = new Map(usage.rateLimits.map(l => [l.kind, l]))
+    const cacheTtlMs = usage.rateLimits.length > 0 ? SUBSCRIPTION_CACHE_TTL_MS : API_CACHE_TTL_MS
     const next: StatusSnapshot = {
       context: {
         pct: usage.context.percent ?? (window > 0 ? Math.floor((tokens * 100) / window) : 0),
@@ -139,7 +207,8 @@ async function refresh($: EngineInterface) {
       fiveHour: toMeter(limits.get('five_hour'), t, false),
       sevenDay: toMeter(limits.get('seven_day'), t, true),
       costUsd: usage.cost?.usd,
-      cacheTtlMs: usage.rateLimits.length > 0 ? SUBSCRIPTION_CACHE_TTL_MS : API_CACHE_TTL_MS,
+      cacheTtlMs,
+      reloadUsd: reloadCostUsd(model, tokens, cacheTtlMs, priceOverrides),
     }
 
     await update($, snapshot, () => next)
@@ -148,15 +217,62 @@ async function refresh($: EngineInterface) {
   }
 }
 
-export const register: Register = on => {
+// Keeps the cache warm: one tiny request over the session's own transcript
+// reads the cached prefix, which restarts its lifetime. Once the cache has
+// gone cold the same request writes it again, at the reload price.
+async function warm($: EngineInterface) {
+  if (await read($, isWarming)) {
+    return
+  }
+
+  await update($, isWarming, () => true)
+
+  try {
+    const r = await $.model.fork({ prompt: 'Reply with just: ok' })
+
+    if (r.isAnswered) {
+      const t = await $.clock.now()
+      await update($, lastTouch, () => t)
+      await update($, now, () => t)
+
+      // The request runs in the background and posts nothing to the chat: say what it did.
+      const { cache_read_input_tokens: hit, cache_creation_input_tokens: wrote } = r.usage
+      $.ui.toast(
+        hit >= wrote
+          ? `Cache kept warm: ${formatTokens(hit)} tokens read from it.`
+          : `Cache was cold: ${formatTokens(wrote)} tokens written to it again.`,
+      )
+    } else if (r.reason === 'nothing-to-fork') {
+      $.ui.toast('Nothing cached yet: send a message first.')
+    } else {
+      $.ui.toast(`Cache refresh failed (${r.reason}).`)
+    }
+  } finally {
+    await update($, isWarming, () => false)
+  }
+
+  void refresh($)
+}
+
+export const register: Register = (on, options) => {
+  subscriptionUsd = typeof options.subscriptionUsd === 'number' && options.subscriptionUsd > 0 ? options.subscriptionUsd : DEFAULT_SUBSCRIPTION_USD
+  priceOverrides = typeof options.inputPrices === 'string' ? parsePrices(options.inputPrices) : []
+
   on('session.start', async ($, e, next) => {
     const result = await next(e)
+
+    await $.command.register({
+      name: 'cache-cold',
+      description: 'Preview the cold-cache state and its reload estimate for 15 seconds (the cache is untouched)',
+    })
 
     // The first version pinned a footer line; the card replaces it.
     $.ui.status(undefined)
 
     // Loaded into a session that already ran turns (a reload, a resume): no turn
     // end was seen, so count from now rather than show no timer.
+    lastRealTurn = await $.clock.now()
+
     if ((await read($, lastTouch)) === null && (await $.session.turns()) > 0) {
       const t = await $.clock.now()
       await update($, lastTouch, () => t)
@@ -166,18 +282,47 @@ export const register: Register = on => {
     void refresh($)
     $.clock.every(REFRESH_MS, () => refresh($))
 
-    // Tick the cache countdown while it can still be warm.
+    // Tick the cache countdown while it can still be warm, and while a
+    // /cache-cold preview runs, so it ends on time.
     $.clock.every(1000, async () => {
       const touched = await read($, lastTouch)
       const s = await read($, snapshot)
       const t = await $.clock.now()
+      const isWarmish = touched !== null && s !== null && t - touched < s.cacheTtlMs + 2000
 
-      if (touched !== null && s !== null && t - touched < s.cacheTtlMs + 2000) {
+      if (isWarmish || t < previewColdUntil + 2000) {
         await update($, now, () => t)
+      }
+
+      // Auto keep-warm: shortly before the cache lapses, while the session is
+      // idle, and only within AUTO_MAX_IDLE_MS of the last real turn.
+      if (touched === null || s === null || !(await read($, isAuto))) {
+        return
+      }
+
+      const left = touched + s.cacheTtlMs - t
+      const isDue = left > 0 && left <= AUTO_LEAD_MS
+      const isIdleTooLong = t - lastRealTurn > AUTO_MAX_IDLE_MS
+
+      if (isDue && !isIdleTooLong && !isTurnRunning && t - lastAutoTry >= AUTO_RETRY_MS) {
+        lastAutoTry = t
+        await warm($)
       }
     })
 
     return result
+  })
+
+  on('command.run', { command: 'cache-cold' }, async $ => {
+    const t = await $.clock.now()
+    previewColdUntil = t + PREVIEW_MS
+    await refresh($)
+    await update($, now, () => t)
+
+    const s = await read($, snapshot)
+    const estimate = s?.reloadUsd === undefined ? 'no estimate for this model' : `~${formatReload(s.reloadUsd)} to reload`
+
+    return { text: `Showing the cache as cold for ${PREVIEW_MS / 1000} seconds (${estimate}). The real cache is untouched.` }
   })
 
   // Context, a rate-limit window or the cost moved.
@@ -187,10 +332,21 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // A main-loop turn uses the cache itself: auto keep-warm waits for it.
+  on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) {
+      isTurnRunning = true
+    }
+
+    return next(e)
+  })
+
   // Every finished main-loop turn has just read or written the cache.
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined) {
       const t = await $.clock.now()
+      isTurnRunning = false
+      lastRealTurn = t
       await update($, lastTouch, () => t)
       await update($, now, () => t)
     }
@@ -209,10 +365,12 @@ export const register: Register = on => {
 
     const touched = await read($, lastTouch)
     const t = await read($, now)
-    const { Box, Text, Svg } = $.ui.resolve(e)
+    const warming = await read($, isWarming)
+    const auto = await read($, isAuto)
+    const { Box, Text, Svg, Button } = $.ui.resolve(e)
 
-    // One text line (label, value, detail) with the bar under it; resting the
-    // pointer on the bar shows `tooltip`.
+    // One text line (label, value, an optional button, detail) with the bar
+    // under it; resting the pointer on the bar shows `tooltip`.
     const block = (
       key: string,
       label: string,
@@ -222,10 +380,12 @@ export const register: Register = on => {
       barColor: string,
       detail?: string,
       tooltip?: string,
+      actions?: RenderElement[],
+      labelColor: Color = 'subtle',
     ) => (
-      <Box key={key} flexDirection="column" gap={0} flexGrow={1} flexShrink={1} width={0}>
-        <Box flexDirection="row" gap={1} alignItems="center">
-          <Text size="caption" color="subtle">
+      <Box key={key} position="relative" flexDirection="column" gap={0} flexGrow={1} flexShrink={1} width={0}>
+        <Box flexDirection="row" gap={1} alignItems="center" width="100%">
+          <Text size="caption" color={labelColor}>
             {label}
           </Text>
           <Text size="caption" weight="semibold" tabular color={color}>
@@ -235,6 +395,13 @@ export const register: Register = on => {
             <Text size="caption" color="subtle" tabular wrap="truncate-end">
               · {detail}
             </Text>
+          )}
+          {actions !== undefined && (
+            // Pinned to the block's right edge, over the end of the bar (the
+            // desktop does not stretch a growing spacer in this row).
+            <Box key="actions" position="absolute" top={0} right={0} flexDirection="row" gap={0} alignItems="center">
+              {actions}
+            </Box>
           )}
         </Box>
         <Svg
@@ -249,6 +416,15 @@ export const register: Register = on => {
     const meter = (key: string, label: string, m: Meter) =>
       block(key, label, `${m.pct}%`, TEXT_COLORS[level(m.pct)], m.pct, BAR_COLORS[level(m.pct)]!, m.detail, m.tooltip)
 
+    // ↻ keeps the cache warm (or writes it again once cold); A switches the
+    // automatic keep-warm on and off. Both are hidden while a reply or a
+    // refresh already uses the cache.
+    const buttons = [
+      <Button key="warm" label="↻" plain dimColor hover={{ color: 'claude' }} onPress={() => warm($)} />,
+      // A starts auto keep-warm; ⏸ (shown while it runs) pauses it again.
+      <Button key="auto" label={auto ? '⏸' : 'A'} plain dimColor hover={{ color: 'claude' }} onPress={() => update($, isAuto, v => !v)} />,
+    ]
+
     // The bar runs down as the cache's lifetime does, coloured by what is gone:
     // full while a turn uses it.
     const cache = () => {
@@ -256,27 +432,52 @@ export const register: Register = on => {
         return block('cache', 'Cache', 'in use', 'success', 100, BAR_COLORS[0]!)
       }
 
-      if (touched === null) {
+      if (warming) {
+        return block('cache', 'Cache', 'refreshing…', 'subtle', 100, BAR_COLORS[0]!)
+      }
+
+      // /cache-cold shows the cold state for a few seconds without touching the cache.
+      const isPreview = t < previewColdUntil
+
+      if (touched === null && !isPreview) {
         return block('cache', 'Cache', '–', 'inactive', 0, BAR_COLORS[0]!)
       }
 
-      const left = touched + s.cacheTtlMs - Math.max(t, touched)
+      const left = isPreview || touched === null ? 0 : touched + s.cacheTtlMs - Math.max(t, touched)
       const usedPct = 100 - (left / s.cacheTtlMs) * 100
 
-      return left > 0
-        ? block(
-            'cache',
-            'Cache',
-            formatClock(left),
-            TEXT_COLORS[level(usedPct)],
-            100 - usedPct,
-            BAR_COLORS[level(usedPct)]!,
-          )
-        : block('cache', 'Cache', 'cold', 'error', 0, BAR_COLORS[0]!)
+      if (left > 0) {
+        return block(
+          'cache',
+          'Cache',
+          formatClock(left),
+          TEXT_COLORS[level(usedPct)],
+          100 - usedPct,
+          BAR_COLORS[level(usedPct)]!,
+          undefined,
+          undefined,
+          buttons,
+        )
+      }
+
+      // Cold: a red label, and what the next message (or ↻) pays to write the
+      // context again where the timer was.
+      return block(
+        'cache',
+        'Cache',
+        s.reloadUsd === undefined ? 'cold' : `~${formatReload(s.reloadUsd)}`,
+        'error',
+        0,
+        BAR_COLORS[0]!,
+        undefined,
+        undefined,
+        buttons,
+        'error',
+      )
     }
 
     const cost = (usd: number) => {
-      const tier = costTier(usd)
+      const tier = costTier(usd, subscriptionUsd)
 
       return block(
         'cost',

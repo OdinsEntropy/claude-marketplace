@@ -8,7 +8,7 @@
     {
       "name": "desktop-statusline",
       "source": "./plugins/desktop-statusline",
-      "description": "Claude desktop app only. A usage bar above the prompt with context, 5-hour and 7-day limits, a prompt cache countdown and the session cost at API prices."
+      "description": "Claude desktop app only. A usage bar above the prompt with context, 5-hour and 7-day limits, a prompt cache countdown with a keep-warm button and the session cost at API prices."
     }
   ]
 }
